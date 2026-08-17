@@ -20,7 +20,7 @@ type Client struct {
 
 type RemoteError struct {
 	StatusCode int
-	Code       wire.ErrorCode
+	Code       string
 	Message    string
 }
 
@@ -31,7 +31,7 @@ func (e *RemoteError) Error() string {
 	return fmt.Sprintf("sqlite-store: %s", e.Message)
 }
 
-func (e *RemoteError) Unwrap() error { return wire.SentinelForCode(e.Code) }
+func (e *RemoteError) Unwrap() error { return wire.SentinelForCode(wire.ErrorCode(e.Code)) }
 
 func OpenUnix(socketPath string) *Client {
 	tr := &http.Transport{
@@ -128,7 +128,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var e wire.ErrorResponse
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return &RemoteError{StatusCode: resp.StatusCode, Code: e.Code, Message: e.Error}
+			return &RemoteError{StatusCode: resp.StatusCode, Code: string(e.Code), Message: e.Error}
 		}
 		return &RemoteError{StatusCode: resp.StatusCode, Message: "HTTP " + resp.Status}
 	}

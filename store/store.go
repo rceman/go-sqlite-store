@@ -95,10 +95,13 @@ func Open(cfg Config) (*Store, error) {
 	for i := 0; i < cfg.Readers; i++ {
 		conn, err := sqlite3c.Open(toSQLiteConfig(cfg))
 		if err != nil {
-			_ = s.Close()
+			// These readers have not been handed to worker goroutines yet. Close
+			// them before Store.Close releases the database owner lock so ownership
+			// remains exclusive until every SQLite connection is gone.
 			for _, c := range openedReaders {
 				_ = c.Close()
 			}
+			_ = s.Close()
 			return nil, fmt.Errorf("open reader %d: %w", i, err)
 		}
 		openedReaders = append(openedReaders, conn)

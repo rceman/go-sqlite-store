@@ -104,7 +104,11 @@ func (h *Handler) batch(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		stmts[i] = store.Statement{SQL: statement.SQL, Args: args}
+		stmts[i] = store.Statement{
+			SQL:                 statement.SQL,
+			Args:                args,
+			RequireRowsAffected: statement.RequireRowsAffected,
+		}
 	}
 	out, err := h.Store.Batch(r.Context(), stmts)
 	if err != nil {
@@ -128,7 +132,9 @@ func decodeJSON(r io.Reader, dst any) error {
 
 func writeStoreErr(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, store.ErrReadOnlyRequired) ||
+	if errors.Is(err, store.ErrRowsAffectedMismatch) {
+		status = http.StatusConflict
+	} else if errors.Is(err, store.ErrReadOnlyRequired) ||
 		errors.Is(err, store.ErrStatementNotAllowed) ||
 		errors.Is(err, store.ErrMultipleStatements) {
 		status = http.StatusBadRequest

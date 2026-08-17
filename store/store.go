@@ -14,6 +14,8 @@ import (
 
 var (
 	ErrClosed              = errors.New("sqlite store is closed")
+	ErrAlreadyOpen         = errors.New("sqlite store database already has an owner")
+	ErrUnsupportedPlatform = errors.New("sqlite store platform is unsupported")
 	ErrReadOnlyRequired    = sqlite3c.ErrReadOnlyRequired
 	ErrStatementNotAllowed = sqlite3c.ErrStatementNotAllowed
 	ErrMultipleStatements  = sqlite3c.ErrMultipleStatements
@@ -25,9 +27,11 @@ type Store struct {
 	readQ  chan readReq
 	writeQ chan *writeReq
 	done   chan struct{}
+	owner  *ownerLock
 
 	admitMu   sync.RWMutex
 	closeOnce sync.Once
+	closeErr  error
 	wg        sync.WaitGroup
 	stats     counters
 }
@@ -64,9 +68,15 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
+	owner, err := acquireOwnerLock(cfg.Path)
+	if err != nil {
+		return nil, err
+	}
+
 	// Open the writer synchronously so Open fails fast on bad paths/pragmas.
 	writer, err := sqlite3c.Open(toSQLiteConfig(cfg))
 	if err != nil {
+		_ = owner.close()
 		return nil, err
 	}
 
@@ -75,6 +85,7 @@ func Open(cfg Config) (*Store, error) {
 		readQ:  make(chan readReq, cfg.Readers*4),
 		writeQ: make(chan *writeReq, cfg.WriteQueueDepth),
 		done:   make(chan struct{}),
+		owner:  owner,
 	}
 
 	s.wg.Add(1)
@@ -84,10 +95,13 @@ func Open(cfg Config) (*Store, error) {
 	for i := 0; i < cfg.Readers; i++ {
 		conn, err := sqlite3c.Open(toSQLiteConfig(cfg))
 		if err != nil {
-			s.Close()
+			// These readers have not been handed to worker goroutines yet. Close
+			// them before Store.Close releases the database owner lock so ownership
+			// remains exclusive until every SQLite connection is gone.
 			for _, c := range openedReaders {
 				_ = c.Close()
 			}
+			_ = s.Close()
 			return nil, fmt.Errorf("open reader %d: %w", i, err)
 		}
 		openedReaders = append(openedReaders, conn)
@@ -148,7 +162,13 @@ func (s *Store) Batch(ctx context.Context, stmts []Statement) ([]ExecResult, err
 		if st.SQL == "" {
 			return nil, fmt.Errorf("statement %d has empty SQL", i)
 		}
-		copyStmts[i] = Statement{SQL: st.SQL, Args: append([]any(nil), st.Args...)}
+		if st.RequireRowsAffected < 0 {
+			return nil, fmt.Errorf("statement %d require_rows_affected must not be negative", i)
+		}
+		copyStmts[i] = Statement{
+			SQL: st.SQL, Args: append([]any(nil), st.Args...),
+			RequireRowsAffected: st.RequireRowsAffected,
+		}
 	}
 	req := &writeReq{ctx: ctx, stmts: copyStmts, res: make(chan writeResp, 1)}
 	s.admitMu.RLock()
@@ -200,9 +220,12 @@ func (s *Store) Close() error {
 		s.admitMu.Lock()
 		close(s.done)
 		s.admitMu.Unlock()
+		s.wg.Wait()
+		if s.owner != nil {
+			s.closeErr = s.owner.close()
+		}
 	})
-	s.wg.Wait()
-	return nil
+	return s.closeErr
 }
 
 func (s *Store) readerLoop(conn *sqlite3c.Conn) {
@@ -344,10 +367,18 @@ func (s *Store) executeBatch(conn *sqlite3c.Conn, batch []*writeReq) {
 		}
 		results := make([]ExecResult, 0, len(req.stmts))
 		var reqErr error
-		for _, st := range req.stmts {
+		for statementIndex, st := range req.stmts {
 			r, err := conn.ExecUser(st.SQL, st.Args...)
 			if err != nil {
 				reqErr = err
+				break
+			}
+			if st.RequireRowsAffected > 0 && r.RowsAffected != st.RequireRowsAffected {
+				reqErr = &RowsAffectedMismatchError{
+					Statement: statementIndex,
+					Required:  st.RequireRowsAffected,
+					Actual:    r.RowsAffected,
+				}
 				break
 			}
 			results = append(results, r)

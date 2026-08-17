@@ -5,9 +5,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 
+	"github.com/rceman/go-sqlite-store/internal/wire"
 	"github.com/rceman/go-sqlite-store/store"
 )
 
@@ -24,19 +24,6 @@ func NewHandler(s *store.Store) http.Handler {
 	return mux
 }
 
-type sqlRequest struct {
-	SQL  string `json:"sql"`
-	Args []any  `json:"args,omitempty"`
-}
-
-type batchRequest struct {
-	Statements []store.Statement `json:"statements"`
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -44,7 +31,7 @@ func (h *Handler) stats(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, h.Store.Stats())
 }
 func (h *Handler) query(w http.ResponseWriter, r *http.Request) {
-	var req sqlRequest
+	var req wire.SQLRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -53,7 +40,7 @@ func (h *Handler) query(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("sql is required"))
 		return
 	}
-	args, err := normalizeArgs(req.Args)
+	args, err := wire.DecodeArgs(req.Args)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -63,10 +50,15 @@ func (h *Handler) query(w http.ResponseWriter, r *http.Request) {
 		writeStoreErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	encoded, err := wire.EncodeQueryResult(out)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, encoded)
 }
 func (h *Handler) exec(w http.ResponseWriter, r *http.Request) {
-	var req sqlRequest
+	var req wire.SQLRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -75,7 +67,7 @@ func (h *Handler) exec(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("sql is required"))
 		return
 	}
-	args, err := normalizeArgs(req.Args)
+	args, err := wire.DecodeArgs(req.Args)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -88,7 +80,7 @@ func (h *Handler) exec(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 func (h *Handler) batch(w http.ResponseWriter, r *http.Request) {
-	var req batchRequest
+	var req wire.BatchRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -97,19 +89,24 @@ func (h *Handler) batch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, errors.New("batch requires at least one statement"))
 		return
 	}
-	for i := range req.Statements {
-		if strings.TrimSpace(req.Statements[i].SQL) == "" {
+	stmts := make([]store.Statement, len(req.Statements))
+	for i, statement := range req.Statements {
+		if strings.TrimSpace(statement.SQL) == "" {
 			writeErr(w, http.StatusBadRequest, errors.New("batch statement SQL is required"))
 			return
 		}
-		args, err := normalizeArgs(req.Statements[i].Args)
+		args, err := wire.DecodeArgs(statement.Args)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		req.Statements[i].Args = args
+		stmts[i] = store.Statement{
+			SQL:                 statement.SQL,
+			Args:                args,
+			RequireRowsAffected: statement.RequireRowsAffected,
+		}
 	}
-	out, err := h.Store.Batch(r.Context(), req.Statements)
+	out, err := h.Store.Batch(r.Context(), stmts)
 	if err != nil {
 		writeStoreErr(w, err)
 		return
@@ -119,7 +116,6 @@ func (h *Handler) batch(w http.ResponseWriter, r *http.Request) {
 
 func decodeJSON(r io.Reader, dst any) error {
 	dec := json.NewDecoder(io.LimitReader(r, 8<<20))
-	dec.UseNumber()
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
@@ -130,41 +126,20 @@ func decodeJSON(r io.Reader, dst any) error {
 	return nil
 }
 
-func normalizeArgs(args []any) ([]any, error) {
-	out := make([]any, len(args))
-	for i, v := range args {
-		switch x := v.(type) {
-		case json.Number:
-			if n, err := x.Int64(); err == nil {
-				out[i] = n
-				continue
-			}
-			f, err := strconv.ParseFloat(string(x), 64)
-			if err != nil {
-				return nil, err
-			}
-			out[i] = f
-		case nil, bool, string, float64:
-			out[i] = x
-		default:
-			return nil, errors.New("SQL args must be scalar JSON values")
-		}
-	}
-	return out, nil
-}
-
 func writeStoreErr(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, store.ErrReadOnlyRequired) ||
+	if errors.Is(err, store.ErrRowsAffectedMismatch) {
+		status = http.StatusConflict
+	} else if errors.Is(err, store.ErrReadOnlyRequired) ||
 		errors.Is(err, store.ErrStatementNotAllowed) ||
 		errors.Is(err, store.ErrMultipleStatements) {
 		status = http.StatusBadRequest
 	}
-	writeErr(w, status, err)
+	writeJSON(w, status, wire.ErrorResponse{Error: err.Error(), Code: wire.CodeForError(err)})
 }
 
 func writeErr(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, errorResponse{Error: err.Error()})
+	writeJSON(w, status, wire.ErrorResponse{Error: err.Error()})
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

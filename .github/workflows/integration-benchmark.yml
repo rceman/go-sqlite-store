@@ -1,0 +1,20 @@
+name: integration-benchmark
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - name: Install SQLite development package
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+      - name: Integration workloads
+        run: go test ./benchmarks -run '^$' -bench 'Benchmark(MixedEmbedded|MixedUnixSocket|TaskEventEmbedded)$' -benchmem -benchtime=5s -count=3

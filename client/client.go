@@ -10,12 +10,28 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rceman/go-sqlite-store/internal/wire"
 	"github.com/rceman/go-sqlite-store/store"
 )
 
 type Client struct {
 	http *http.Client
 }
+
+type RemoteError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *RemoteError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("sqlite-store: %s (%s)", e.Message, e.Code)
+	}
+	return fmt.Sprintf("sqlite-store: %s", e.Message)
+}
+
+func (e *RemoteError) Unwrap() error { return wire.SentinelForCode(wire.ErrorCode(e.Code)) }
 
 func OpenUnix(socketPath string) *Client {
 	tr := &http.Transport{
@@ -47,20 +63,38 @@ func (c *Client) Stats(ctx context.Context) (store.Stats, error) {
 }
 
 func (c *Client) Query(ctx context.Context, sql string, args ...any) (store.QueryResult, error) {
-	var out store.QueryResult
-	err := c.do(ctx, http.MethodPost, "/v1/query", map[string]any{"sql": sql, "args": args}, &out)
-	return out, err
+	encoded, err := wire.EncodeArgs(args)
+	if err != nil {
+		return store.QueryResult{}, err
+	}
+	var out wire.QueryResult
+	if err := c.do(ctx, http.MethodPost, "/v1/query", wire.SQLRequest{SQL: sql, Args: encoded}, &out); err != nil {
+		return store.QueryResult{}, err
+	}
+	return wire.DecodeQueryResult(out)
 }
 
 func (c *Client) Exec(ctx context.Context, sql string, args ...any) (store.ExecResult, error) {
+	encoded, err := wire.EncodeArgs(args)
+	if err != nil {
+		return store.ExecResult{}, err
+	}
 	var out store.ExecResult
-	err := c.do(ctx, http.MethodPost, "/v1/exec", map[string]any{"sql": sql, "args": args}, &out)
+	err = c.do(ctx, http.MethodPost, "/v1/exec", wire.SQLRequest{SQL: sql, Args: encoded}, &out)
 	return out, err
 }
 
 func (c *Client) Batch(ctx context.Context, stmts []store.Statement) ([]store.ExecResult, error) {
+	encoded := wire.BatchRequest{Statements: make([]wire.Statement, len(stmts))}
+	for i, st := range stmts {
+		args, err := wire.EncodeArgs(st.Args)
+		if err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i, err)
+		}
+		encoded.Statements[i] = wire.Statement{SQL: st.SQL, Args: args, RequireRowsAffected: st.RequireRowsAffected}
+	}
 	var out []store.ExecResult
-	err := c.do(ctx, http.MethodPost, "/v1/batch", map[string]any{"statements": stmts}, &out)
+	err := c.do(ctx, http.MethodPost, "/v1/batch", encoded, &out)
 	return out, err
 }
 
@@ -92,13 +126,11 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var e struct {
-			Error string `json:"error"`
-		}
+		var e wire.ErrorResponse
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("sqlite-store: %s", e.Error)
+			return &RemoteError{StatusCode: resp.StatusCode, Code: string(e.Code), Message: e.Error}
 		}
-		return fmt.Errorf("sqlite-store: HTTP %s", resp.Status)
+		return &RemoteError{StatusCode: resp.StatusCode, Message: "HTTP " + resp.Status}
 	}
 	if out == nil {
 		return nil

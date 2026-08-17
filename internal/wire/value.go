@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/rceman/go-sqlite-store/store"
 )
@@ -90,6 +91,8 @@ func EncodeValue(v any) (Value, error) {
 		return Value{Kind: KindText, Text: x}, nil
 	case []byte:
 		return Value{Kind: KindBlob, Blob: append([]byte(nil), x...)}, nil
+	case time.Time:
+		return Value{Kind: KindInteger, Integer: x.UnixNano()}, nil
 	default:
 		return Value{}, fmt.Errorf("unsupported SQL value type %T", v)
 	}

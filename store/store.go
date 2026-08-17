@@ -12,7 +12,12 @@ import (
 	"github.com/rceman/go-sqlite-store/internal/sqlite3c"
 )
 
-var ErrClosed = errors.New("sqlite store is closed")
+var (
+	ErrClosed              = errors.New("sqlite store is closed")
+	ErrReadOnlyRequired    = sqlite3c.ErrReadOnlyRequired
+	ErrStatementNotAllowed = sqlite3c.ErrStatementNotAllowed
+	ErrMultipleStatements  = sqlite3c.ErrMultipleStatements
+)
 
 type Store struct {
 	cfg Config
@@ -21,6 +26,7 @@ type Store struct {
 	writeQ chan *writeReq
 	done   chan struct{}
 
+	admitMu   sync.RWMutex
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 	stats     counters
@@ -100,16 +106,21 @@ func (s *Store) Query(ctx context.Context, sql string, args ...any) (QueryResult
 		ctx = context.Background()
 	}
 	req := readReq{ctx: ctx, sql: sql, args: append([]any(nil), args...), res: make(chan readResp, 1)}
+	s.admitMu.RLock()
 	select {
 	case <-s.done:
+		s.admitMu.RUnlock()
 		return QueryResult{}, ErrClosed
-	case <-ctx.Done():
-		return QueryResult{}, ctx.Err()
-	case s.readQ <- req:
+	default:
 	}
 	select {
-	case <-s.done:
-		return QueryResult{}, ErrClosed
+	case <-ctx.Done():
+		s.admitMu.RUnlock()
+		return QueryResult{}, ctx.Err()
+	case s.readQ <- req:
+		s.admitMu.RUnlock()
+	}
+	select {
 	case <-ctx.Done():
 		return QueryResult{}, ctx.Err()
 	case out := <-req.res:
@@ -140,16 +151,21 @@ func (s *Store) Batch(ctx context.Context, stmts []Statement) ([]ExecResult, err
 		copyStmts[i] = Statement{SQL: st.SQL, Args: append([]any(nil), st.Args...)}
 	}
 	req := &writeReq{ctx: ctx, stmts: copyStmts, res: make(chan writeResp, 1)}
+	s.admitMu.RLock()
 	select {
 	case <-s.done:
+		s.admitMu.RUnlock()
 		return nil, ErrClosed
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case s.writeQ <- req:
+	default:
 	}
 	select {
-	case <-s.done:
-		return nil, ErrClosed
+	case <-ctx.Done():
+		s.admitMu.RUnlock()
+		return nil, ctx.Err()
+	case s.writeQ <- req:
+		s.admitMu.RUnlock()
+	}
+	select {
 	case <-ctx.Done():
 		// The writer may still commit this request if it already started. This mirrors
 		// normal database cancellation semantics: callers must use idempotency where needed.
@@ -178,7 +194,13 @@ func (s *Store) Stats() Stats {
 }
 
 func (s *Store) Close() error {
-	s.closeOnce.Do(func() { close(s.done) })
+	s.closeOnce.Do(func() {
+		// Serialize against admission so every request accepted before done closes is
+		// visible in a queue before workers switch into drain mode.
+		s.admitMu.Lock()
+		close(s.done)
+		s.admitMu.Unlock()
+	})
 	s.wg.Wait()
 	return nil
 }
@@ -186,24 +208,39 @@ func (s *Store) Close() error {
 func (s *Store) readerLoop(conn *sqlite3c.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
+	closing := false
 	for {
-		select {
-		case <-s.done:
-			return
-		case req := <-s.readQ:
-			if err := req.ctx.Err(); err != nil {
-				req.res <- readResp{err: err}
+		var req readReq
+		if closing {
+			select {
+			case req = <-s.readQ:
+			default:
+				return
+			}
+		} else {
+			select {
+			case <-s.done:
+				closing = true
 				continue
+			case req = <-s.readQ:
 			}
-			result, err := conn.Query(req.sql, req.args...)
-			if err != nil {
-				s.stats.failedReads.Add(1)
-			} else {
-				s.stats.reads.Add(1)
-			}
-			req.res <- readResp{result: result, err: err}
 		}
+		s.executeRead(conn, req)
 	}
+}
+
+func (s *Store) executeRead(conn *sqlite3c.Conn, req readReq) {
+	if err := req.ctx.Err(); err != nil {
+		req.res <- readResp{err: err}
+		return
+	}
+	result, err := conn.QueryReadOnly(req.sql, req.args...)
+	if err != nil {
+		s.stats.failedReads.Add(1)
+	} else {
+		s.stats.reads.Add(1)
+	}
+	req.res <- readResp{result: result, err: err}
 }
 
 func (s *Store) writerLoop(conn *sqlite3c.Conn) {
@@ -214,45 +251,62 @@ func (s *Store) writerLoop(conn *sqlite3c.Conn) {
 		<-timer.C
 	}
 
+	closing := false
 	for {
-		select {
-		case <-s.done:
-			s.failPending(ErrClosed)
-			return
-		case first := <-s.writeQ:
-			batch := []*writeReq{first}
-			deadline := s.cfg.BatchWindow
-			if deadline > 0 && len(batch) < s.cfg.BatchSize {
-				timer.Reset(deadline)
-			collect:
-				for len(batch) < s.cfg.BatchSize {
-					select {
-					case req := <-s.writeQ:
-						batch = append(batch, req)
-					case <-timer.C:
-						break collect
-					case <-s.done:
-						if !timer.Stop() {
-							select {
-							case <-timer.C:
-							default:
-							}
-						}
-						for _, req := range batch {
-							req.res <- writeResp{err: ErrClosed}
-						}
-						s.failPending(ErrClosed)
-						return
-					}
-				}
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
+		var first *writeReq
+		if closing {
+			select {
+			case first = <-s.writeQ:
+			default:
+				return
+			}
+		} else {
+			select {
+			case <-s.done:
+				closing = true
+				continue
+			case first = <-s.writeQ:
+			}
+		}
+
+		batch := []*writeReq{first}
+		if closing {
+			s.drainWriteBatch(&batch)
+		} else if s.cfg.BatchWindow > 0 && len(batch) < s.cfg.BatchSize {
+			timer.Reset(s.cfg.BatchWindow)
+		collect:
+			for len(batch) < s.cfg.BatchSize {
+				select {
+				case req := <-s.writeQ:
+					batch = append(batch, req)
+				case <-timer.C:
+					break collect
+				case <-s.done:
+					closing = true
+					break collect
 				}
 			}
-			s.executeBatch(conn, batch)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if closing {
+				s.drainWriteBatch(&batch)
+			}
+		}
+		s.executeBatch(conn, batch)
+	}
+}
+
+func (s *Store) drainWriteBatch(batch *[]*writeReq) {
+	for len(*batch) < s.cfg.BatchSize {
+		select {
+		case req := <-s.writeQ:
+			*batch = append(*batch, req)
+		default:
+			return
 		}
 	}
 }
@@ -271,10 +325,7 @@ func (s *Store) executeBatch(conn *sqlite3c.Conn, batch []*writeReq) {
 	}
 
 	if err := conn.BeginImmediate(); err != nil {
-		s.stats.failedWrites.Add(uint64(len(active)))
-		for _, req := range active {
-			req.res <- writeResp{err: err}
-		}
+		s.failBatch(active, err)
 		return
 	}
 
@@ -284,17 +335,17 @@ func (s *Store) executeBatch(conn *sqlite3c.Conn, batch []*writeReq) {
 		err     error
 	}
 	outcomes := make([]pending, 0, len(active))
-	successCount := 0
 	for i, req := range active {
 		name := fmt.Sprintf("r%d", i)
 		if _, err := conn.Exec("SAVEPOINT " + name); err != nil {
-			outcomes = append(outcomes, pending{req: req, err: err})
-			continue
+			_ = conn.Rollback()
+			s.failBatch(active, fmt.Errorf("create request savepoint: %w", err))
+			return
 		}
 		results := make([]ExecResult, 0, len(req.stmts))
 		var reqErr error
 		for _, st := range req.stmts {
-			r, err := conn.Exec(st.SQL, st.Args...)
+			r, err := conn.ExecUser(st.SQL, st.Args...)
 			if err != nil {
 				reqErr = err
 				break
@@ -302,25 +353,30 @@ func (s *Store) executeBatch(conn *sqlite3c.Conn, batch []*writeReq) {
 			results = append(results, r)
 		}
 		if reqErr != nil {
-			_, _ = conn.Exec("ROLLBACK TO " + name)
-			_, _ = conn.Exec("RELEASE " + name)
+			if _, err := conn.Exec("ROLLBACK TO " + name); err != nil {
+				_ = conn.Rollback()
+				s.failBatch(active, fmt.Errorf("rollback request savepoint: %w", err))
+				return
+			}
+			if _, err := conn.Exec("RELEASE " + name); err != nil {
+				_ = conn.Rollback()
+				s.failBatch(active, fmt.Errorf("release failed request savepoint: %w", err))
+				return
+			}
 			outcomes = append(outcomes, pending{req: req, err: reqErr})
 			continue
 		}
 		if _, err := conn.Exec("RELEASE " + name); err != nil {
-			outcomes = append(outcomes, pending{req: req, err: err})
-			continue
+			_ = conn.Rollback()
+			s.failBatch(active, fmt.Errorf("release request savepoint: %w", err))
+			return
 		}
-		successCount++
 		outcomes = append(outcomes, pending{req: req, results: results})
 	}
 
 	if err := conn.Commit(); err != nil {
 		_ = conn.Rollback()
-		s.stats.failedWrites.Add(uint64(len(active)))
-		for _, out := range outcomes {
-			out.req.res <- writeResp{err: err}
-		}
+		s.failBatch(active, err)
 		return
 	}
 
@@ -334,17 +390,12 @@ func (s *Store) executeBatch(conn *sqlite3c.Conn, batch []*writeReq) {
 		s.stats.writes.Add(1)
 		out.req.res <- writeResp{results: out.results}
 	}
-	_ = successCount
 }
 
-func (s *Store) failPending(err error) {
-	for {
-		select {
-		case req := <-s.writeQ:
-			req.res <- writeResp{err: err}
-		default:
-			return
-		}
+func (s *Store) failBatch(reqs []*writeReq, err error) {
+	s.stats.failedWrites.Add(uint64(len(reqs)))
+	for _, req := range reqs {
+		req.res <- writeResp{err: err}
 	}
 }
 
@@ -357,6 +408,6 @@ func toSQLiteConfig(cfg Config) sqlite3c.Config {
 		MmapBytes:         cfg.MmapBytes,
 		WALAutoCheckpoint: cfg.WALAutoCheckpoint,
 		JournalSizeLimit:  cfg.JournalSizeLimit,
-		ForeignKeys:       cfg.ForeignKeys,
+		ForeignKeys:       !cfg.DisableForeignKeys,
 	}
 }

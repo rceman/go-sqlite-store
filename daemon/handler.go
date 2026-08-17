@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/rceman/go-sqlite-store/store"
 )
@@ -48,6 +49,10 @@ func (h *Handler) query(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if strings.TrimSpace(req.SQL) == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("sql is required"))
+		return
+	}
 	args, err := normalizeArgs(req.Args)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -55,7 +60,7 @@ func (h *Handler) query(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.Store.Query(r.Context(), req.SQL, args...)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeStoreErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -66,6 +71,10 @@ func (h *Handler) exec(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if strings.TrimSpace(req.SQL) == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("sql is required"))
+		return
+	}
 	args, err := normalizeArgs(req.Args)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -73,7 +82,7 @@ func (h *Handler) exec(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.Store.Exec(r.Context(), req.SQL, args...)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeStoreErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -84,7 +93,15 @@ func (h *Handler) batch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	if len(req.Statements) == 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("batch requires at least one statement"))
+		return
+	}
 	for i := range req.Statements {
+		if strings.TrimSpace(req.Statements[i].SQL) == "" {
+			writeErr(w, http.StatusBadRequest, errors.New("batch statement SQL is required"))
+			return
+		}
 		args, err := normalizeArgs(req.Statements[i].Args)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, err)
@@ -94,7 +111,7 @@ func (h *Handler) batch(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.Store.Batch(r.Context(), req.Statements)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeStoreErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -134,6 +151,16 @@ func normalizeArgs(args []any) ([]any, error) {
 		}
 	}
 	return out, nil
+}
+
+func writeStoreErr(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, store.ErrReadOnlyRequired) ||
+		errors.Is(err, store.ErrStatementNotAllowed) ||
+		errors.Is(err, store.ErrMultipleStatements) {
+		status = http.StatusBadRequest
+	}
+	writeErr(w, status, err)
 }
 
 func writeErr(w http.ResponseWriter, status int, err error) {

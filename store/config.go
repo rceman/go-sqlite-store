@@ -3,18 +3,18 @@ package store
 import "time"
 
 type Config struct {
-	Path              string
-	Readers           int
-	WriteQueueDepth   int
-	BatchSize         int
-	BatchWindow       time.Duration
-	BusyTimeout       time.Duration
-	CacheKiB          int
-	MmapBytes         int64
-	WALAutoCheckpoint int
-	JournalSizeLimit  int64
-	Synchronous       string
-	ForeignKeys       bool
+	Path               string
+	Readers            int
+	WriteQueueDepth    int
+	BatchSize          int
+	BatchWindow        time.Duration
+	BusyTimeout        time.Duration
+	CacheKiB           int
+	MmapBytes          int64
+	WALAutoCheckpoint  int
+	JournalSizeLimit   int64
+	Synchronous        string
+	DisableForeignKeys bool
 }
 
 func (c Config) withDefaults() Config {

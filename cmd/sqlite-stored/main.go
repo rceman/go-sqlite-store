@@ -29,6 +29,7 @@ func main() {
 	flag.IntVar(&cfg.CacheKiB, "cache-kib", 8192, "SQLite cache budget per connection in KiB")
 	flag.IntVar(&cfg.WALAutoCheckpoint, "wal-autocheckpoint", 2000, "WAL autocheckpoint page threshold")
 	flag.StringVar(&cfg.Synchronous, "synchronous", "FULL", "SQLite synchronous mode")
+	flag.BoolVar(&cfg.DisableForeignKeys, "disable-foreign-keys", false, "disable SQLite foreign key enforcement")
 	flag.Parse()
 
 	if cfg.Path == "" || socket == "" {
@@ -79,6 +80,14 @@ func listenUnix(path string) (net.Listener, error) {
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("refusing to remove non-socket path %s", path)
+		}
+		conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("unix socket %s is already accepting connections", path)
+		}
+		if !errors.Is(dialErr, syscall.ECONNREFUSED) && !os.IsNotExist(dialErr) {
+			return nil, fmt.Errorf("check existing unix socket %s: %w", path, dialErr)
 		}
 		if err := os.Remove(path); err != nil {
 			return nil, err

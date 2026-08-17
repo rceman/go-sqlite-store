@@ -5,6 +5,45 @@ package sqlite3c
 #include <sqlite3.h>
 #include <stdlib.h>
 
+static int user_write_authorizer(void *unused, int action, const char *a, const char *b, const char *c, const char *d) {
+    (void)unused; (void)a; (void)b; (void)c; (void)d;
+    switch (action) {
+    case SQLITE_TRANSACTION:
+    case SQLITE_SAVEPOINT:
+    case SQLITE_ATTACH:
+    case SQLITE_DETACH:
+    case SQLITE_PRAGMA:
+        return SQLITE_DENY;
+    default:
+        return SQLITE_OK;
+    }
+}
+
+static int user_read_authorizer(void *unused, int action, const char *a, const char *b, const char *c, const char *d) {
+    (void)unused; (void)a; (void)b; (void)c; (void)d;
+    switch (action) {
+    case SQLITE_TRANSACTION:
+    case SQLITE_SAVEPOINT:
+    case SQLITE_ATTACH:
+    case SQLITE_DETACH:
+        return SQLITE_DENY;
+    default:
+        return SQLITE_OK;
+    }
+}
+
+static int set_user_write_authorizer(sqlite3 *db) {
+    return sqlite3_set_authorizer(db, user_write_authorizer, NULL);
+}
+
+static int set_user_read_authorizer(sqlite3 *db) {
+    return sqlite3_set_authorizer(db, user_read_authorizer, NULL);
+}
+
+static int clear_authorizer(sqlite3 *db) {
+    return sqlite3_set_authorizer(db, NULL, NULL);
+}
+
 static int bind_text_transient(sqlite3_stmt *stmt, int idx, const char *v, int n) {
     return sqlite3_bind_text(stmt, idx, v, n, SQLITE_TRANSIENT);
 }
@@ -19,13 +58,17 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 	"unsafe"
 )
 
 var (
-	ErrBusy   = errors.New("sqlite busy")
-	ErrLocked = errors.New("sqlite locked")
+	ErrBusy                = errors.New("sqlite busy")
+	ErrLocked              = errors.New("sqlite locked")
+	ErrReadOnlyRequired    = errors.New("sqlite statement must be read-only")
+	ErrStatementNotAllowed = errors.New("sqlite statement is not allowed through the managed store API")
+	ErrMultipleStatements  = errors.New("sqlite request must contain exactly one statement")
 )
 
 type Config struct {
@@ -78,9 +121,15 @@ func Open(cfg Config) (*Conn, error) {
 	}
 	C.sqlite3_busy_timeout(db, C.int(timeoutMS))
 
-	syncMode := cfg.Synchronous
+	syncMode := strings.ToUpper(strings.TrimSpace(cfg.Synchronous))
 	if syncMode == "" {
 		syncMode = "FULL"
+	}
+	switch syncMode {
+	case "FULL", "NORMAL", "EXTRA", "OFF":
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("unsupported synchronous mode %q", cfg.Synchronous)
 	}
 	if cfg.CacheKiB <= 0 {
 		cfg.CacheKiB = 8192
@@ -153,12 +202,59 @@ func (c *Conn) Exec(sql string, args ...any) (ExecResult, error) {
 	}, nil
 }
 
+// ExecUser executes one caller-supplied write statement while preserving store-owned
+// transaction and connection semantics. Transaction control, ATTACH/DETACH and PRAGMA
+// statements are rejected.
+func (c *Conn) ExecUser(sql string, args ...any) (ExecResult, error) {
+	stmt, err := c.prepareUser(sql, false)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	defer C.sqlite3_finalize(stmt)
+	if err := bindAll(stmt, args); err != nil {
+		return ExecResult{}, err
+	}
+	for {
+		rc := C.sqlite3_step(stmt)
+		if rc == C.SQLITE_ROW {
+			continue
+		}
+		if rc != C.SQLITE_DONE {
+			return ExecResult{}, c.errForRC(rc)
+		}
+		break
+	}
+	return ExecResult{
+		RowsAffected: int64(C.sqlite3_changes(c.db)),
+		LastInsertID: int64(C.sqlite3_last_insert_rowid(c.db)),
+	}, nil
+}
+
+// QueryReadOnly executes exactly one caller-supplied statement and rejects anything
+// SQLite does not classify as read-only. This prevents reader connections from
+// bypassing the single-writer invariant (for example with INSERT ... RETURNING).
+func (c *Conn) QueryReadOnly(sql string, args ...any) (QueryResult, error) {
+	stmt, err := c.prepareUser(sql, true)
+	if err != nil {
+		return QueryResult{}, err
+	}
+	defer C.sqlite3_finalize(stmt)
+	if C.sqlite3_stmt_readonly(stmt) == 0 {
+		return QueryResult{}, ErrReadOnlyRequired
+	}
+	return c.queryPrepared(stmt, args)
+}
+
 func (c *Conn) Query(sql string, args ...any) (QueryResult, error) {
 	stmt, err := c.prepare(sql)
 	if err != nil {
 		return QueryResult{}, err
 	}
 	defer C.sqlite3_finalize(stmt)
+	return c.queryPrepared(stmt, args)
+}
+
+func (c *Conn) queryPrepared(stmt *C.sqlite3_stmt, args []any) (QueryResult, error) {
 	if err := bindAll(stmt, args); err != nil {
 		return QueryResult{}, err
 	}
@@ -193,9 +289,54 @@ func (c *Conn) prepare(sql string) (*C.sqlite3_stmt, error) {
 	csql := C.CString(sql)
 	defer C.free(unsafe.Pointer(csql))
 	var stmt *C.sqlite3_stmt
-	rc := C.sqlite3_prepare_v2(c.db, csql, -1, &stmt, nil)
+	var tail *C.char
+	rc := C.sqlite3_prepare_v2(c.db, csql, -1, &stmt, &tail)
 	if rc != C.SQLITE_OK {
 		return nil, c.errForRC(rc)
+	}
+	if stmt == nil {
+		return nil, errors.New("sqlite statement is empty")
+	}
+
+	// Ask SQLite to parse the tail too. Whitespace/comments produce no statement;
+	// any second real statement is rejected to keep one request = one statement.
+	if tail != nil && *tail != 0 {
+		var extra *C.sqlite3_stmt
+		rc = C.sqlite3_prepare_v2(c.db, tail, -1, &extra, nil)
+		if rc != C.SQLITE_OK {
+			C.sqlite3_finalize(stmt)
+			return nil, c.errForRC(rc)
+		}
+		if extra != nil {
+			C.sqlite3_finalize(extra)
+			C.sqlite3_finalize(stmt)
+			return nil, ErrMultipleStatements
+		}
+	}
+	return stmt, nil
+}
+
+func (c *Conn) prepareUser(sql string, readOnly bool) (*C.sqlite3_stmt, error) {
+	var rc C.int
+	if readOnly {
+		rc = C.set_user_read_authorizer(c.db)
+	} else {
+		rc = C.set_user_write_authorizer(c.db)
+	}
+	if rc != C.SQLITE_OK {
+		return nil, c.errForRC(rc)
+	}
+	stmt, err := c.prepare(sql)
+	clearRC := C.clear_authorizer(c.db)
+	if err != nil {
+		if strings.Contains(err.Error(), "not authorized") {
+			return nil, fmt.Errorf("%w: %v", ErrStatementNotAllowed, err)
+		}
+		return nil, err
+	}
+	if clearRC != C.SQLITE_OK {
+		C.sqlite3_finalize(stmt)
+		return nil, c.errForRC(clearRC)
 	}
 	return stmt, nil
 }

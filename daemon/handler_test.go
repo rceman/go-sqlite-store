@@ -46,3 +46,32 @@ func TestHandlerExecAndQuery(t *testing.T) {
 		t.Fatalf("got %#v", got.Rows)
 	}
 }
+
+func TestHandlerEnforcesManagedSQLBoundary(t *testing.T) {
+	s, err := store.Open(store.Config{Path: filepath.Join(t.TempDir(), "boundary.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := NewHandler(s)
+
+	call := func(path string, body any) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(body)
+		r := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(b))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := call("/v1/exec", map[string]any{"sql": "CREATE TABLE kv(k TEXT PRIMARY KEY)"}); w.Code != http.StatusOK {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	if w := call("/v1/query", map[string]any{"sql": "INSERT INTO kv(k) VALUES('x') RETURNING k"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("mutating query: got %d %s", w.Code, w.Body.String())
+	}
+	if w := call("/v1/exec", map[string]any{"sql": "BEGIN"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("transaction control: got %d %s", w.Code, w.Body.String())
+	}
+	if w := call("/v1/exec", map[string]any{"sql": "CREATE TABLE a(id INTEGER); CREATE TABLE b(id INTEGER)"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("multiple statements: got %d %s", w.Code, w.Body.String())
+	}
+}

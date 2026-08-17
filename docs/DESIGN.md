@@ -11,7 +11,7 @@ clients
                                       `--> bounded micro-batches
 ```
 
-The default read pool is intentionally small. In the benchmark workload, adding reader connections past the useful level increased CPU and RSS without improving point-query throughput.
+The default read pool is intentionally small. In the benchmark workload, adding reader connections past the useful level increased CPU and RSS without improving point-query throughput. Reader requests are additionally checked with `sqlite3_stmt_readonly`, so SQL routed through `Query` cannot mutate state and bypass the single-writer path.
 
 ## Write batching
 
@@ -30,7 +30,9 @@ COMMIT
 
 A failing request rolls back to its savepoint, so its statements do not partially apply and unrelated requests in the same outer transaction can still succeed. A failure of the outer commit fails every request whose result depended on that commit.
 
-This deliberately trades a bounded amount of commit independence for substantially lower fsync/WAL pressure. Requests remain serializable in writer order.
+This deliberately trades a bounded amount of commit independence for substantially lower fsync/WAL pressure. Requests remain serializable in writer order. Caller SQL cannot issue `BEGIN`, `COMMIT`, `ROLLBACK`, savepoint control, `ATTACH`/`DETACH`, or `PRAGMA`; the store owns those connection and transaction semantics. A request is also restricted to exactly one parsed SQLite statement.
+
+`Close()` is graceful: it closes admission first, drains requests that were already accepted, then closes the SQLite connections. This avoids acknowledging a write and subsequently discarding it merely because the embedding process began an orderly shutdown.
 
 ## Durability defaults
 

@@ -23,7 +23,7 @@ _, err = s.Exec(ctx, `INSERT INTO events(kind,payload) VALUES(?,?)`, "task.updat
 rows, err := s.Query(ctx, `SELECT id,kind FROM events ORDER BY id DESC LIMIT ?`, 20)
 ```
 
-Concurrent write requests are serialized by the writer goroutine and co-committed in bounded transactions. Each request is wrapped in a savepoint so one failed request does not partially apply or poison unrelated requests in the same micro-batch.
+Concurrent write requests are serialized by the writer goroutine and co-committed in bounded transactions. Each request is wrapped in a savepoint so one failed request does not partially apply or poison unrelated requests in the same micro-batch. `Close()` stops admission and drains work that was already accepted before closing the SQLite connections.
 
 ## Daemon
 
@@ -46,6 +46,12 @@ The protocol is HTTP/JSON over a Unix Domain Socket. The `client` package provid
 
 The daemon API is intentionally a generic SQL transport. Applications that need a domain-level contract should wrap it with named operations rather than exposing arbitrary SQL across trust boundaries.
 
+The store still owns its concurrency and durability boundary:
+
+- `Query` accepts only statements SQLite classifies as read-only, so a reader cannot bypass the writer with `INSERT ... RETURNING`;
+- `Exec`/`Batch` reject caller-owned transaction/savepoint control, `ATTACH`/`DETACH`, and `PRAGMA`;
+- each request must contain exactly one SQLite statement (a `Batch` is the explicit multi-statement API).
+
 ## Defaults
 
 | Setting | Default |
@@ -62,7 +68,7 @@ The daemon API is intentionally a generic SQL transport. Applications that need 
 | mmap | 256 MiB |
 | WAL autocheckpoint | 2000 pages |
 | journal size limit | 64 MiB |
-| foreign keys | enabled |
+| foreign keys | enabled (`DisableForeignKeys` / `--disable-foreign-keys` to opt out) |
 
 These defaults came from parallel SQLite stress tests with 16 logical clients. They are a baseline, not a universal optimum; storage hardware and workload shape still matter.
 

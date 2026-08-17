@@ -26,6 +26,7 @@ static int user_read_authorizer(void *unused, int action, const char *a, const c
     case SQLITE_SAVEPOINT:
     case SQLITE_ATTACH:
     case SQLITE_DETACH:
+    case SQLITE_PRAGMA:
         return SQLITE_DENY;
     default:
         return SQLITE_OK;

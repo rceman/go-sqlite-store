@@ -186,6 +186,14 @@ func TestManagedWriteRejectsTransactionControlAndPragma(t *testing.T) {
 	}
 }
 
+func TestManagedReadRejectsPragma(t *testing.T) {
+	s := newTestStore(t, Config{})
+	ctx := context.Background()
+	if _, err := s.Query(ctx, `PRAGMA cache_size=-1`); !errors.Is(err, ErrStatementNotAllowed) {
+		t.Fatalf("got %v, want ErrStatementNotAllowed", err)
+	}
+}
+
 func TestRejectsMultipleStatements(t *testing.T) {
 	s := newTestStore(t, Config{})
 	ctx := context.Background()

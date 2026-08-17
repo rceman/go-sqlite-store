@@ -61,8 +61,16 @@ func TestTaskEventAtomicityUnderConcurrentLoad(t *testing.T) {
 			for revision := 1; revision <= revisionsPerTask; revision++ {
 				eventID := fmt.Sprintf("EVT-%s-%03d", taskID, revision)
 				results, err := s.Batch(ctx, []Statement{
-					{SQL: `UPDATE tasks SET revision=? WHERE id=? AND revision=?`, Args: []any{revision, taskID, revision - 1}},
-					{SQL: `INSERT INTO events(id, task_id, revision, kind) VALUES(?, ?, ?, 'task.revised')`, Args: []any{eventID, taskID, revision}},
+					{
+						SQL:                 `UPDATE tasks SET revision=? WHERE id=? AND revision=?`,
+						Args:                []any{revision, taskID, revision - 1},
+						RequireRowsAffected: 1,
+					},
+					{
+						SQL:                 `INSERT INTO events(id, task_id, revision, kind) VALUES(?, ?, ?, 'task.revised')`,
+						Args:                []any{eventID, taskID, revision},
+						RequireRowsAffected: 1,
+					},
 				})
 				if err != nil {
 					errCh <- fmt.Errorf("%s revision %d: %w", taskID, revision, err)

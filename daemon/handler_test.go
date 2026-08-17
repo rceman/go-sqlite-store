@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/rceman/go-sqlite-store/internal/wire"
 	"github.com/rceman/go-sqlite-store/store"
 )
 
@@ -27,23 +28,35 @@ func TestHandlerExecAndQuery(t *testing.T) {
 		h.ServeHTTP(w, r)
 		return w
 	}
-	if w := call("/v1/exec", map[string]any{"sql": "CREATE TABLE kv(k TEXT PRIMARY KEY,v INTEGER)"}); w.Code != 200 {
+	if w := call("/v1/exec", wire.SQLRequest{SQL: "CREATE TABLE kv(k TEXT PRIMARY KEY,v INTEGER,b BLOB)"}); w.Code != 200 {
 		t.Fatalf("create: %d %s", w.Code, w.Body.String())
 	}
-	if w := call("/v1/exec", map[string]any{"sql": "INSERT INTO kv(k,v) VALUES(?,?)", "args": []any{"a", 7}}); w.Code != 200 {
+	args, err := wire.EncodeArgs([]any{"a", int64(7), []byte{0, 255}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := call("/v1/exec", wire.SQLRequest{SQL: "INSERT INTO kv(k,v,b) VALUES(?,?,?)", Args: args}); w.Code != 200 {
 		t.Fatalf("insert: %d %s", w.Code, w.Body.String())
 	}
-	w := call("/v1/query", map[string]any{"sql": "SELECT v FROM kv WHERE k=?", "args": []any{"a"}})
+	queryArgs, _ := wire.EncodeArgs([]any{"a"})
+	w := call("/v1/query", wire.SQLRequest{SQL: "SELECT v,b FROM kv WHERE k=?", Args: queryArgs})
 	if w.Code != 200 {
 		t.Fatalf("query: %d %s", w.Code, w.Body.String())
 	}
-	var got store.QueryResult
-	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+	var encoded wire.QueryResult
+	if err := json.Unmarshal(w.Body.Bytes(), &encoded); err != nil {
 		t.Fatal(err)
 	}
-	// JSON turns int64 into float64 when decoding into interface{}.
-	if len(got.Rows) != 1 || got.Rows[0][0] != float64(7) {
-		t.Fatalf("got %#v", got.Rows)
+	got, err := wire.DecodeQueryResult(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Rows) != 1 || got.Rows[0][0] != int64(7) {
+		t.Fatalf("integer type/value lost: %#v", got.Rows)
+	}
+	blob, ok := got.Rows[0][1].([]byte)
+	if !ok || len(blob) != 2 || blob[0] != 0 || blob[1] != 255 {
+		t.Fatalf("blob type/value lost: %#v", got.Rows[0][1])
 	}
 }
 
@@ -62,16 +75,16 @@ func TestHandlerEnforcesManagedSQLBoundary(t *testing.T) {
 		h.ServeHTTP(w, r)
 		return w
 	}
-	if w := call("/v1/exec", map[string]any{"sql": "CREATE TABLE kv(k TEXT PRIMARY KEY)"}); w.Code != http.StatusOK {
+	if w := call("/v1/exec", wire.SQLRequest{SQL: "CREATE TABLE kv(k TEXT PRIMARY KEY)"}); w.Code != http.StatusOK {
 		t.Fatalf("create: %d %s", w.Code, w.Body.String())
 	}
-	if w := call("/v1/query", map[string]any{"sql": "INSERT INTO kv(k) VALUES('x') RETURNING k"}); w.Code != http.StatusBadRequest {
+	if w := call("/v1/query", wire.SQLRequest{SQL: "INSERT INTO kv(k) VALUES('x') RETURNING k"}); w.Code != http.StatusBadRequest {
 		t.Fatalf("mutating query: got %d %s", w.Code, w.Body.String())
 	}
-	if w := call("/v1/exec", map[string]any{"sql": "BEGIN"}); w.Code != http.StatusBadRequest {
+	if w := call("/v1/exec", wire.SQLRequest{SQL: "BEGIN"}); w.Code != http.StatusBadRequest {
 		t.Fatalf("transaction control: got %d %s", w.Code, w.Body.String())
 	}
-	if w := call("/v1/exec", map[string]any{"sql": "CREATE TABLE a(id INTEGER); CREATE TABLE b(id INTEGER)"}); w.Code != http.StatusBadRequest {
+	if w := call("/v1/exec", wire.SQLRequest{SQL: "CREATE TABLE a(id INTEGER); CREATE TABLE b(id INTEGER)"}); w.Code != http.StatusBadRequest {
 		t.Fatalf("multiple statements: got %d %s", w.Code, w.Body.String())
 	}
 }

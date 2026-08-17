@@ -2,6 +2,9 @@ name: integration-benchmark
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feature/integration-ready]
+    paths: ['.github/workflows/integration-benchmark.yml']
 
 permissions:
   contents: read

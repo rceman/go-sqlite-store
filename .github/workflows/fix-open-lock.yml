@@ -1,0 +1,47 @@
+name: fix-open-lock
+
+on:
+  push:
+    branches: [feature/integration-ready]
+    paths: ['.github/workflows/fix-open-lock.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - name: Install SQLite development package
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+      - name: Keep owner lock until every opened connection is closed
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('store/store.go')
+          s = p.read_text()
+          old = '''\t\tif err != nil {\n\t\t\t_ = s.Close()\n\t\t\tfor _, c := range openedReaders {\n\t\t\t\t_ = c.Close()\n\t\t\t}\n\t\t\treturn nil, fmt.Errorf("open reader %d: %w", i, err)\n\t\t}'''
+          new = '''\t\tif err != nil {\n\t\t\t// These readers have not been handed to worker goroutines yet. Close\n\t\t\t// them before Store.Close releases the database owner lock so ownership\n\t\t\t// remains exclusive until every SQLite connection is gone.\n\t\t\tfor _, c := range openedReaders {\n\t\t\t\t_ = c.Close()\n\t\t\t}\n\t\t\t_ = s.Close()\n\t\t\treturn nil, fmt.Errorf("open reader %d: %w", i, err)\n\t\t}'''
+          assert s.count(old) == 1, 'expected Open reader cleanup snippet exactly once'
+          p.write_text(s.replace(old, new, 1))
+      - name: Verify full repository
+        run: |
+          gofmt -w store/store.go
+          test -z "$(gofmt -l .)"
+          go test ./...
+          go vet ./...
+          go test -race ./...
+          go build ./cmd/sqlite-stored
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add store/store.go
+          git commit -m 'fix: retain owner lock through failed open cleanup'
+          git push origin HEAD:feature/integration-ready

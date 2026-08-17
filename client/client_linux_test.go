@@ -4,6 +4,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -73,5 +74,48 @@ func TestUnixClientPreservesSQLiteValueTypes(t *testing.T) {
 	}
 	if out.Rows[0][4] != nil {
 		t.Fatalf("null=%#v (%T)", out.Rows[0][4], out.Rows[0][4])
+	}
+}
+
+func TestUnixClientPreservesRowsAffectedMismatch(t *testing.T) {
+	s, err := store.Open(store.Config{Path: filepath.Join(t.TempDir(), "remote-error.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	sock := filepath.Join(t.TempDir(), "store.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: daemon.NewHandler(s)}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ln) }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-done
+	}()
+
+	c := OpenUnix(sock)
+	defer c.CloseIdleConnections()
+	ctx := context.Background()
+	if _, err := c.Exec(ctx, `CREATE TABLE tasks(id TEXT PRIMARY KEY, revision INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Exec(ctx, `INSERT INTO tasks(id,revision) VALUES('TSK-1',1)`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Batch(ctx, []store.Statement{{
+		SQL:                 `UPDATE tasks SET revision=2 WHERE id='TSK-1' AND revision=0`,
+		RequireRowsAffected: 1,
+	}})
+	if !errors.Is(err, store.ErrRowsAffectedMismatch) {
+		t.Fatalf("expected remote ErrRowsAffectedMismatch, got %v", err)
+	}
+	var remote *RemoteError
+	if !errors.As(err, &remote) || remote.StatusCode != http.StatusConflict {
+		t.Fatalf("expected HTTP 409 RemoteError, got %#v", err)
 	}
 }

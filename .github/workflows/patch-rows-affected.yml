@@ -40,15 +40,19 @@ jobs:
           assert old in s, 'execute snippet not found'
           s = s.replace(old, new, 1)
           p.write_text(s)
-      - name: Verify
+      - name: Verify full repository
         run: |
           gofmt -w store/store.go
-          go test ./store
-          go vet ./store
-      - name: Commit
+          test -z "$(gofmt -l .)"
+          go test ./...
+          go vet ./...
+          go test -race ./...
+      - name: Commit and rebase
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add store/store.go
           git commit -m 'feat: rollback batch request on rows-affected mismatch'
+          git fetch origin feature/integration-ready
+          git rebase origin/feature/integration-ready
           git push origin HEAD:feature/integration-ready

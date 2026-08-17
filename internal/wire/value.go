@@ -36,8 +36,9 @@ type SQLRequest struct {
 }
 
 type Statement struct {
-	SQL  string  `json:"sql"`
-	Args []Value `json:"args,omitempty"`
+	SQL                 string  `json:"sql"`
+	Args                []Value `json:"args,omitempty"`
+	RequireRowsAffected int64   `json:"require_rows_affected,omitempty"`
 }
 
 type BatchRequest struct {

@@ -76,7 +76,7 @@ func (c *Client) Batch(ctx context.Context, stmts []store.Statement) ([]store.Ex
 		if err != nil {
 			return nil, fmt.Errorf("statement %d: %w", i, err)
 		}
-		encoded.Statements[i] = wire.Statement{SQL: st.SQL, Args: args}
+		encoded.Statements[i] = wire.Statement{SQL: st.SQL, Args: args, RequireRowsAffected: st.RequireRowsAffected}
 	}
 	var out []store.ExecResult
 	err := c.do(ctx, http.MethodPost, "/v1/batch", encoded, &out)

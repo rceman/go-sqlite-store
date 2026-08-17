@@ -18,6 +18,21 @@ type Client struct {
 	http *http.Client
 }
 
+type RemoteError struct {
+	StatusCode int
+	Code       wire.ErrorCode
+	Message    string
+}
+
+func (e *RemoteError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("sqlite-store: %s (%s)", e.Message, e.Code)
+	}
+	return fmt.Sprintf("sqlite-store: %s", e.Message)
+}
+
+func (e *RemoteError) Unwrap() error { return wire.SentinelForCode(e.Code) }
+
 func OpenUnix(socketPath string) *Client {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -111,13 +126,11 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		var e struct {
-			Error string `json:"error"`
-		}
+		var e wire.ErrorResponse
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("sqlite-store: %s", e.Error)
+			return &RemoteError{StatusCode: resp.StatusCode, Code: e.Code, Message: e.Error}
 		}
-		return fmt.Errorf("sqlite-store: HTTP %s", resp.Status)
+		return &RemoteError{StatusCode: resp.StatusCode, Message: "HTTP " + resp.Status}
 	}
 	if out == nil {
 		return nil

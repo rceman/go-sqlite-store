@@ -96,7 +96,7 @@ func Apply(ctx context.Context, s Store, migrations []Migration, opts Options) e
 	for _, m := range ordered {
 		if name, ok := applied[m.Version]; ok {
 			if name != m.Name {
-				return fmt.Errorf("migrate: version %d already applied as %q, requested %q", m.Version, name)
+				return fmt.Errorf("migrate: version %d already applied as %q, requested %q", m.Version, name, m.Name)
 			}
 			continue
 		}

@@ -14,6 +14,8 @@ import (
 
 var (
 	ErrClosed              = errors.New("sqlite store is closed")
+	ErrAlreadyOpen         = errors.New("sqlite store database already has an owner")
+	ErrUnsupportedPlatform = errors.New("sqlite store platform is unsupported")
 	ErrReadOnlyRequired    = sqlite3c.ErrReadOnlyRequired
 	ErrStatementNotAllowed = sqlite3c.ErrStatementNotAllowed
 	ErrMultipleStatements  = sqlite3c.ErrMultipleStatements
@@ -25,9 +27,11 @@ type Store struct {
 	readQ  chan readReq
 	writeQ chan *writeReq
 	done   chan struct{}
+	owner  *ownerLock
 
 	admitMu   sync.RWMutex
 	closeOnce sync.Once
+	closeErr  error
 	wg        sync.WaitGroup
 	stats     counters
 }
@@ -64,9 +68,15 @@ func Open(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
+	owner, err := acquireOwnerLock(cfg.Path)
+	if err != nil {
+		return nil, err
+	}
+
 	// Open the writer synchronously so Open fails fast on bad paths/pragmas.
 	writer, err := sqlite3c.Open(toSQLiteConfig(cfg))
 	if err != nil {
+		_ = owner.close()
 		return nil, err
 	}
 
@@ -75,6 +85,7 @@ func Open(cfg Config) (*Store, error) {
 		readQ:  make(chan readReq, cfg.Readers*4),
 		writeQ: make(chan *writeReq, cfg.WriteQueueDepth),
 		done:   make(chan struct{}),
+		owner:  owner,
 	}
 
 	s.wg.Add(1)
@@ -84,7 +95,7 @@ func Open(cfg Config) (*Store, error) {
 	for i := 0; i < cfg.Readers; i++ {
 		conn, err := sqlite3c.Open(toSQLiteConfig(cfg))
 		if err != nil {
-			s.Close()
+			_ = s.Close()
 			for _, c := range openedReaders {
 				_ = c.Close()
 			}
@@ -200,9 +211,12 @@ func (s *Store) Close() error {
 		s.admitMu.Lock()
 		close(s.done)
 		s.admitMu.Unlock()
+		s.wg.Wait()
+		if s.owner != nil {
+			s.closeErr = s.owner.close()
+		}
 	})
-	s.wg.Wait()
-	return nil
+	return s.closeErr
 }
 
 func (s *Store) readerLoop(conn *sqlite3c.Conn) {

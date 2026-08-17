@@ -39,19 +39,20 @@ func TestUnixClientPreservesSQLiteValueTypes(t *testing.T) {
 	c := OpenUnix(sock)
 	defer c.CloseIdleConnections()
 	ctx := context.Background()
-	if _, err := c.Exec(ctx, `CREATE TABLE values_test(i INTEGER, r REAL, t TEXT, b BLOB, n TEXT)`); err != nil {
+	if _, err := c.Exec(ctx, `CREATE TABLE values_test(i INTEGER, r REAL, t TEXT, b BLOB, n TEXT, ts INTEGER)`); err != nil {
 		t.Fatal(err)
 	}
 	max := int64(9223372036854775807)
 	blob := []byte{0, 1, 254, 255}
-	if _, err := c.Exec(ctx, `INSERT INTO values_test(i,r,t,b,n) VALUES(?,?,?,?,?)`, max, 1.25, "hello", blob, nil); err != nil {
+	stamp := time.Unix(1_700_000_000, 123_456_789).UTC()
+	if _, err := c.Exec(ctx, `INSERT INTO values_test(i,r,t,b,n,ts) VALUES(?,?,?,?,?,?)`, max, 1.25, "hello", blob, nil, stamp); err != nil {
 		t.Fatal(err)
 	}
-	out, err := c.Query(ctx, `SELECT i,r,t,b,n FROM values_test`)
+	out, err := c.Query(ctx, `SELECT i,r,t,b,n,ts FROM values_test`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Rows) != 1 || len(out.Rows[0]) != 5 {
+	if len(out.Rows) != 1 || len(out.Rows[0]) != 6 {
 		t.Fatalf("unexpected rows: %#v", out.Rows)
 	}
 	if got, ok := out.Rows[0][0].(int64); !ok || got != max {
@@ -74,6 +75,9 @@ func TestUnixClientPreservesSQLiteValueTypes(t *testing.T) {
 	}
 	if out.Rows[0][4] != nil {
 		t.Fatalf("null=%#v (%T)", out.Rows[0][4], out.Rows[0][4])
+	}
+	if got, ok := out.Rows[0][5].(int64); !ok || got != stamp.UnixNano() {
+		t.Fatalf("time=%#v (%T), want %d", out.Rows[0][5], out.Rows[0][5], stamp.UnixNano())
 	}
 }
 

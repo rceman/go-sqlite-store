@@ -50,8 +50,16 @@ func BenchmarkTaskEventEmbedded(b *testing.B) {
 			taskID := fmt.Sprintf("TSK-%02d", id%taskCount)
 			if n%5 == 0 {
 				if _, err := s.Batch(ctx, []store.Statement{
-					{SQL: `UPDATE tasks SET revision=revision+1 WHERE id=?`, Args: []any{taskID}},
-					{SQL: `INSERT INTO events(id,task_id,kind,payload) VALUES(?,?,'task.revised',?)`, Args: []any{id, taskID, payload}},
+					{
+						SQL:                 `UPDATE tasks SET revision=revision+1 WHERE id=?`,
+						Args:                []any{taskID},
+						RequireRowsAffected: 1,
+					},
+					{
+						SQL:                 `INSERT INTO events(id,task_id,kind,payload) VALUES(?,?,'task.revised',?)`,
+						Args:                []any{id, taskID, payload},
+						RequireRowsAffected: 1,
+					},
 				}); err != nil {
 					b.Error(err)
 				}

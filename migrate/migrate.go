@@ -24,10 +24,17 @@ type Options struct {
 	Table string
 }
 
+type Store interface {
+	Query(context.Context, string, ...any) (store.QueryResult, error)
+	Exec(context.Context, string, ...any) (store.ExecResult, error)
+	Batch(context.Context, []store.Statement) ([]store.ExecResult, error)
+}
+
 // Apply applies each missing migration exactly once. Each migration's statements
-// and its version marker are submitted as one Store.Batch request, so they share
-// the store's per-request atomicity boundary.
-func Apply(ctx context.Context, s *store.Store, migrations []Migration, opts Options) error {
+// and its version marker are submitted as one Batch request, so they share the
+// managed store's per-request atomicity boundary. Run migrations before normal
+// application traffic is admitted.
+func Apply(ctx context.Context, s Store, migrations []Migration, opts Options) error {
 	if s == nil {
 		return errors.New("migrate: store is required")
 	}
@@ -89,7 +96,7 @@ func Apply(ctx context.Context, s *store.Store, migrations []Migration, opts Opt
 	for _, m := range ordered {
 		if name, ok := applied[m.Version]; ok {
 			if name != m.Name {
-				return fmt.Errorf("migrate: version %d already applied as %q, requested %q", m.Version, name, m.Name)
+				return fmt.Errorf("migrate: version %d already applied as %q, requested %q", m.Version, name)
 			}
 			continue
 		}

@@ -13,11 +13,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: '1.23.x'
       - name: Install SQLite development package
         run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+      - name: Fast-forward to latest feature head
+        run: |
+          git fetch origin feature/integration-ready
+          git checkout feature/integration-ready
+          git reset --hard origin/feature/integration-ready
       - name: Patch store atomically
         shell: python
         run: |

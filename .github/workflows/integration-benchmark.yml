@@ -1,8 +1,7 @@
 name: integration-benchmark
 
 on:
-  push:
-    branches: [feature/integration-ready]
+  workflow_dispatch:
 
 permissions:
   contents: read

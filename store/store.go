@@ -159,7 +159,13 @@ func (s *Store) Batch(ctx context.Context, stmts []Statement) ([]ExecResult, err
 		if st.SQL == "" {
 			return nil, fmt.Errorf("statement %d has empty SQL", i)
 		}
-		copyStmts[i] = Statement{SQL: st.SQL, Args: append([]any(nil), st.Args...)}
+		if st.RequireRowsAffected < 0 {
+			return nil, fmt.Errorf("statement %d require_rows_affected must not be negative", i)
+		}
+		copyStmts[i] = Statement{
+			SQL: st.SQL, Args: append([]any(nil), st.Args...),
+			RequireRowsAffected: st.RequireRowsAffected,
+		}
 	}
 	req := &writeReq{ctx: ctx, stmts: copyStmts, res: make(chan writeResp, 1)}
 	s.admitMu.RLock()
@@ -358,10 +364,18 @@ func (s *Store) executeBatch(conn *sqlite3c.Conn, batch []*writeReq) {
 		}
 		results := make([]ExecResult, 0, len(req.stmts))
 		var reqErr error
-		for _, st := range req.stmts {
+		for statementIndex, st := range req.stmts {
 			r, err := conn.ExecUser(st.SQL, st.Args...)
 			if err != nil {
 				reqErr = err
+				break
+			}
+			if st.RequireRowsAffected > 0 && r.RowsAffected != st.RequireRowsAffected {
+				reqErr = &RowsAffectedMismatchError{
+					Statement: statementIndex,
+					Required:  st.RequireRowsAffected,
+					Actual:    r.RowsAffected,
+				}
 				break
 			}
 			results = append(results, r)

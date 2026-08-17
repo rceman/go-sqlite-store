@@ -24,10 +24,6 @@ func NewHandler(s *store.Store) http.Handler {
 	return mux
 }
 
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -139,11 +135,11 @@ func writeStoreErr(w http.ResponseWriter, err error) {
 		errors.Is(err, store.ErrMultipleStatements) {
 		status = http.StatusBadRequest
 	}
-	writeErr(w, status, err)
+	writeJSON(w, status, wire.ErrorResponse{Error: err.Error(), Code: wire.CodeForError(err)})
 }
 
 func writeErr(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, errorResponse{Error: err.Error()})
+	writeJSON(w, status, wire.ErrorResponse{Error: err.Error()})
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

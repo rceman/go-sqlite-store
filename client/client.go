@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/rceman/go-sqlite-store/internal/wire"
 	"github.com/rceman/go-sqlite-store/store"
 )
 
@@ -47,20 +48,38 @@ func (c *Client) Stats(ctx context.Context) (store.Stats, error) {
 }
 
 func (c *Client) Query(ctx context.Context, sql string, args ...any) (store.QueryResult, error) {
-	var out store.QueryResult
-	err := c.do(ctx, http.MethodPost, "/v1/query", map[string]any{"sql": sql, "args": args}, &out)
-	return out, err
+	encoded, err := wire.EncodeArgs(args)
+	if err != nil {
+		return store.QueryResult{}, err
+	}
+	var out wire.QueryResult
+	if err := c.do(ctx, http.MethodPost, "/v1/query", wire.SQLRequest{SQL: sql, Args: encoded}, &out); err != nil {
+		return store.QueryResult{}, err
+	}
+	return wire.DecodeQueryResult(out)
 }
 
 func (c *Client) Exec(ctx context.Context, sql string, args ...any) (store.ExecResult, error) {
+	encoded, err := wire.EncodeArgs(args)
+	if err != nil {
+		return store.ExecResult{}, err
+	}
 	var out store.ExecResult
-	err := c.do(ctx, http.MethodPost, "/v1/exec", map[string]any{"sql": sql, "args": args}, &out)
+	err = c.do(ctx, http.MethodPost, "/v1/exec", wire.SQLRequest{SQL: sql, Args: encoded}, &out)
 	return out, err
 }
 
 func (c *Client) Batch(ctx context.Context, stmts []store.Statement) ([]store.ExecResult, error) {
+	encoded := wire.BatchRequest{Statements: make([]wire.Statement, len(stmts))}
+	for i, st := range stmts {
+		args, err := wire.EncodeArgs(st.Args)
+		if err != nil {
+			return nil, fmt.Errorf("statement %d: %w", i, err)
+		}
+		encoded.Statements[i] = wire.Statement{SQL: st.SQL, Args: args}
+	}
 	var out []store.ExecResult
-	err := c.do(ctx, http.MethodPost, "/v1/batch", map[string]any{"statements": stmts}, &out)
+	err := c.do(ctx, http.MethodPost, "/v1/batch", encoded, &out)
 	return out, err
 }
 
